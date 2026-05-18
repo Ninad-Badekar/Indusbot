@@ -1,0 +1,13 @@
+.env
+.venv/
+.local/
+/models/
+piper/
+piper_linux_x86_64.tar.gz
+backend/ava.db*
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.agents/
+.cursor/
