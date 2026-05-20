@@ -6,19 +6,26 @@ from pathlib import Path
 
 from app.config import settings
 
-_greeting_ulaw: bytes | None = None
+_tts_cache: dict[str, bytes] = {}
+_greeting_text: str | None = None
 
 
 def cache_greeting(text: str) -> None:
-    global _greeting_ulaw
-    _greeting_ulaw = synthesize_speech(text)
+    global _greeting_text
+    _greeting_text = text
+    synthesize_speech(text)
 
 
 def get_cached_greeting() -> bytes | None:
-    return _greeting_ulaw
+    if _greeting_text and _greeting_text in _tts_cache:
+        return _tts_cache[_greeting_text]
+    return None
 
 
 def synthesize_speech(text: str) -> bytes:
+    if text in _tts_cache:
+        return _tts_cache[text]
+
     voice_path = Path(settings.piper_voice_path)
     if not voice_path.exists():
         raise FileNotFoundError(f"Piper voice model not found at {voice_path}")
@@ -45,6 +52,7 @@ def synthesize_speech(text: str) -> bytes:
             pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 8000, None)
 
         ulaw = audioop.lin2ulaw(pcm, 2)
+        _tts_cache[text] = ulaw
         return ulaw
 
     finally:

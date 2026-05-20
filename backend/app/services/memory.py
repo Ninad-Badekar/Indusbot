@@ -6,6 +6,12 @@ _CONFIRMATION = re.compile(
     re.IGNORECASE,
 )
 
+_NEGATED_CONFIRMATION = re.compile(
+    r"\b(?:not|never|neither|nor|cannot|no)\s+(?:\S+\s+){0,2}(?:done|completed|finished|proceed)\b|"
+    r"\w+n't\s+(?:\S+\s+){0,2}(?:done|completed|finished|proceed)\b",
+    re.IGNORECASE,
+)
+
 _MAX_STEP = 8
 
 
@@ -33,7 +39,10 @@ class SessionMemory:
         return self._step[session_id]
 
     def is_confirmation(self, text: str) -> bool:
-        return bool(_CONFIRMATION.search(text))
+        if not _CONFIRMATION.search(text):
+            return False
+        cleaned = _NEGATED_CONFIRMATION.sub("", text)
+        return bool(_CONFIRMATION.search(cleaned))
 
     def set_bot_speaking(self, session_id: str, speaking: bool) -> None:
         self._bot_speaking[session_id] = speaking

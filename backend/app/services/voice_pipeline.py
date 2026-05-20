@@ -6,7 +6,7 @@ from fastapi import WebSocket
 from app.config import settings
 from app.conversation_log import log_speech
 from app.debug_log import debug_log
-from app.services.llm import stream_voice_sentences
+from app.services.llm import classify_intent, stream_voice_sentences
 from app.services.memory import session_memory
 from app.services.retrieval import get_step_content, search, extract_step_responses
 from app.services.voice_outbound import stream_sentences_to_caller
@@ -43,17 +43,35 @@ async def run_voice_pipeline(
     log_speech(session_id, "caller", user_text)
 
     step = session_memory.get_step(session_id)
-    if session_memory.is_confirmation(user_text):
-        step = session_memory.advance_step(session_id)
-        logger.info("[%s] User confirmed — advanced to step %d", session_id[:8], step)
 
-    step_query = f"Step {step} for IndusDirect setup guide"
+    # Get current step content first (needed for intent classification)
     context = await get_step_content(step)
     if not context:
+        step_query = f"Step {step} for IndusDirect setup guide"
         context = await search(step_query, top_k=VOICE_RETRIEVAL_TOP_K)
-    fallback_phrases = ("Fallback", "Confused", "OTP", "Website Not Opening", "Human Support")
-    if not context.strip() or any(p in context[:80] for p in fallback_phrases):
-        context = await search(user_text, top_k=VOICE_RETRIEVAL_TOP_K)
+    is_step_chunk = context.startswith("## Step")
+    if not context.strip() or (not is_step_chunk and any(p in context[:80] for p in ("Fallback", "Confused", "OTP", "Website Not Opening", "Human Support"))):
+        fallback_query = user_text
+        context = await search(fallback_query, top_k=VOICE_RETRIEVAL_TOP_K)
+
+    # Classify user intent using LLM (understands natural language)
+    intent = await classify_intent(user_text, step, context)
+    user_lower = user_text.lower()
+
+    # Determine action based on intent
+    if intent == "confirm":
+        step = session_memory.advance_step(session_id)
+        logger.info("[%s] Intent=confirm — advanced to step %d", session_id[:8], step)
+        # Get new step content after advancement
+        context = await get_step_content(step)
+        if not context:
+            context = await search(f"Step {step} for IndusDirect setup guide", top_k=VOICE_RETRIEVAL_TOP_K)
+    elif intent == "repeat":
+        logger.info("[%s] Intent=repeat — repeating step %d", session_id[:8], step)
+    elif intent == "confused":
+        logger.info("[%s] Intent=confused — repeating step %d with encouragement", session_id[:8], step)
+    else:
+        logger.info("[%s] Intent=%s — using LLM for step %d", session_id[:8], intent, step)
 
     t0 = time.monotonic()
     t_retrieval = time.monotonic()
@@ -64,7 +82,7 @@ async def run_voice_pipeline(
         data={
             "user_text": user_text[:120],
             "current_step": step,
-            "step_query": step_query,
+            "intent": intent,
             "context_len": len(context),
             "context_empty": not bool(context.strip()),
             "context_preview": context[:200] if context else "",
@@ -76,21 +94,17 @@ async def run_voice_pipeline(
 
     use_llm = False
     kb_responses = extract_step_responses(context) if 1 <= step <= 8 else []
-    user_lower = user_text.lower()
     is_goodbye = step >= 8 and any(w in user_lower for w in ("bye", "goodbye", "thanks", "thank"))
 
     if kb_responses and is_goodbye:
-        # Goodbye after Step 8 completion
         async def _goodbye_sentences():
             yield "You're welcome."
             yield "Your IndusDirect setup is complete."
             yield "Goodbye."
         sentences = _goodbye_sentences()
-    elif kb_responses and 1 <= step <= 8:
-        # Direct step instruction from KB — no LLM needed
+    elif kb_responses and 1 <= step <= 8 and intent != "off_topic":
         sentences = _kb_sentences(kb_responses, is_active)
     else:
-        # LLM path for non-step / fallback content
         use_llm = True
         context_with_step = f"[Current step: {step}]\n{context}"
         sentences = stream_voice_sentences(user_text, context_with_step, history)

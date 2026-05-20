@@ -6,56 +6,47 @@ AI voice assistant that guides users through corporate bank account setup over t
 
 ```
 Caller → Twilio → Real-Time Transcriptions (STT webhook)
-  → FAISS vector search → Ollama (voice: llama3.2:1b) → Piper TTS → WebSocket /stream → caller
+  → knowledge base step lookup → Intent Classifier (hybrid)
+  → Step KB response / LLM fallback → Piper TTS (cached) → WebSocket /stream → caller
 ```
+
+**Processing flow:**
+1. Twilio sends user speech via transcription callback
+2. Voice pipeline resolves current step from KB index (direct step lookup, no embedding search for numbered steps)
+3. Intent classifier determines user intent (confirm/repeat/confused/off_topic) using a hybrid approach
+4. For steps 1–8, KB responses are served directly (zero hallucination, pre-cached in TTS)
+5. Piper TTS streams audio back through Twilio's WebSocket media stream
 
 ## Prerequisites
 
 - **Python 3.11+**
 - **[Ollama](https://ollama.com/download)** (local LLM runtime)
-- **PostgreSQL 16+** (conversation tables; created on startup)
 - **[Twilio](https://twilio.com)** account with a voice-enabled phone number
 - **curl** (for setup scripts)
+- **CPU only** (no GPU required; all inference runs on CPU)
 
 ## Quick Start
 
 ```bash
-# 1. Clone and enter the project
-cd Indusbot
-
-# 2. One-time setup: venv, Piper, voice model, Ollama pulls
+# 1. One-time setup (venv, dependencies, Piper TTS, Ollama models, .env)
 chmod +x scripts/*.sh
-./scripts/setup-local.sh
+./scripts/setup.sh
 
-# 3. Configure environment (if setup did not create it)
-cp .env.example .env
-# Edit .env: Twilio credentials, PUBLIC_BASE_URL (ngrok HTTPS URL)
+# 2. Edit .env with your Twilio credentials and PUBLIC_BASE_URL (ngrok HTTPS URL)
 
-# 4. Start Ollama (if not already running as a service)
+# 3. Start Ollama (if not already running as a service)
 ollama serve   # in another terminal, or use systemd
 
-# 5. Run the backend
-./scripts/run-local.sh
+# 4. Run the backend
+PYTHONPATH=backend .venv/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
-
-### PostgreSQL
-
-Create the default database user (once):
-
-```bash
-sudo -u postgres psql -c "CREATE USER ava WITH PASSWORD 'ava';"
-sudo -u postgres psql -c "CREATE DATABASE ava OWNER ava;"
-```
-
-Or set `DATABASE_URL` in `.env` to your existing Postgres instance.
 
 ## Local services
 
 | Service | Port | How to run |
 |---------|------|------------|
-| Backend | `8000` | `./scripts/run-local.sh` |
+| Backend | `8000` | `PYTHONPATH=backend .venv/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000` |
 | Ollama | `11434` | `ollama serve` (install via ollama.com) |
-| PostgreSQL | `5432` | System package or existing instance |
 
 ## API Endpoints
 
@@ -75,6 +66,14 @@ curl -X POST http://localhost:8000/api/chat \
   -d '{"message": "How do I open a corporate account?"}'
 ```
 
+Make a test call:
+
+```bash
+curl -X POST http://localhost:8000/incoming-call \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "CallSid=test123&From=%2B15551234567"
+```
+
 ## Twilio Setup
 
 1. Buy a Twilio phone number with voice capability
@@ -91,7 +90,9 @@ curl -X POST http://localhost:8000/api/chat \
 
 ## Piper TTS
 
-`setup-local.sh` installs the Piper binary under `.local/piper/` and downloads `en_US-lessac-medium` to `models/voice.onnx`.
+`setup.sh` installs the Piper binary under `.local/piper/` and downloads `en_US-lessac-medium` to `models/voice.onnx`.
+
+**Pre-caching:** At startup, all 13 unique KB step responses + 3 goodbye sentences are pre-synthesised and cached in an in-memory dict (`_tts_cache`). This adds ~195s to startup time on CPU but makes every response during a call instant (< 100ms).
 
 To use a different voice:
 
@@ -102,18 +103,41 @@ To use a different voice:
 
 ## Ollama models
 
-Voice calls use `llama3.2:1b` for low latency on CPU. Text chat uses `llama3`. Configure via `OLLAMA_MODEL` / `OLLAMA_VOICE_MODEL` in `.env`.
+Configured via `OLLAMA_MODEL` / `OLLAMA_VOICE_MODEL` in `.env`:
+
+| Model | Used for | Typical latency (CPU) |
+|-------|----------|-----------------------|
+| `llama3.1:8b` | Text chat responses, intent classification for ambiguous utterances | 2–3s per short-prompt inference |
+| `llama3.2:1b` | Voice response streaming (when LLM fallback is needed) | 0.5–3s per token generation |
+
+Pull them:
 
 ```bash
-ollama pull llama3
+ollama pull llama3.1:8b
 ollama pull llama3.2:1b
 ```
 
-(`setup-local.sh` runs these automatically if Ollama is installed.)
+(`setup.sh` runs these automatically if Ollama is installed.)
+
+## Intent Classification (Hybrid LLM + Regex)
+
+User intent is determined through a multi-stage pipeline, from fastest to slowest:
+
+1. **Fast-path keyword sets** (0ms) — exact-match against `_CONFIRM_WORDS` (done, yes, proceed, i did, etc.) and `_REPEAT_WORDS` (repeat, help, wait, etc.). Handles ~80% of utterances instantly.
+
+2. **LLM-based classification** (2–3s) — for non-obvious utterances, a short prompt (`Step N: ...\nUser: ...\nIntent:`) is sent to `llama3.1:8b` with a 5s timeout. Output is post-processed via keyword matching.
+
+3. **Regex fallback** (instant) — if the LLM times out or returns garbage, a comprehensive regex pipeline checks for confirmation (with negation awareness), repeat requests, confusion indicators, and off-topic queries in that order.
+
+4. **Negation detection** — patterns like "haven't done", "not yet", "cannot proceed" are stripped before confirmation keywords are checked, preventing false step advances on "I haven't done that yet" while allowing "I haven't done that but I want to proceed" (mixed affirmations work correctly).
+
+All results are cached by `step||text` key, so repeated utterances are instant.
 
 ## Knowledge Base
 
-Add `.md` files to `backend/knowledge_base/`. The RAG pipeline chunks on `##` headers and indexes them with FAISS. The index is rebuilt on every backend restart.
+KB files live in `backend/knowledge_base/`. The RAG pipeline chunks on `##` headers and indexes them with FAISS. However, **numbered steps 1–8 are resolved directly** via `get_step_content()` from a pre-built dict mapping step numbers to chunks — no embedding search is used for the core step flow, eliminating hallucination risk.
+
+The embedding search (`search()`) is only used as a fallback when a step chunk is not found, or for non-step queries.
 
 ## Project Structure
 
@@ -121,25 +145,40 @@ Add `.md` files to `backend/knowledge_base/`. The RAG pipeline chunks on `##` he
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # FastAPI entry point
-│   │   ├── config.py            # Environment config
-│   │   ├── routers/             # Twilio webhooks, stream, chat
-│   │   ├── services/            # RAG, LLM, TTS, voice pipeline
-│   │   └── db/                  # SQLAlchemy models
-│   ├── knowledge_base/          # Markdown files for RAG
+│   │   ├── config.py            # Environment config (ollama_model, ollama_voice_model, etc.)
+│   │   ├── conversation_log.py  # Speech logging to /tmp
+│   │   ├── debug_log.py         # Hypothesis-driven debug logging
+│   │   ├── routers/
+│   │   │   ├── calls.py         # Twilio voice webhook (TwiML)
+│   │   │   ├── transcription.py # STT callback + confidence filtering (>= 0.9)
+│   │   │   ├── stream.py        # WebSocket media stream for Piper outbound
+│   │   │   └── chat.py          # Text chat endpoint
+│   │   ├── services/
+│   │   │   ├── voice_pipeline.py # Main orchestration: intent → response → TTS
+│   │   │   ├── llm.py           # classify_intent(), stream_voice_sentences(), warmup()
+│   │   │   ├── memory.py        # SessionMemory: step tracking, confirmation regex, negation
+│   │   │   ├── retrieval.py     # get_step_content(), extract_step_responses(), search() (FAISS)
+│   │   │   ├── tts.py           # Piper TTS synthesis + _tts_cache
+│   │   │   └── voice_outbound.py # WebSocket streaming helper
+│   │   └── db/                  # SQLAlchemy models (conversation logging)
+│   ├── knowledge_base/
+│   │   └── indusdirect_setup.md # Step-by-step guide (source of truth)
 │   └── requirements.txt
-├── models/                      # Piper voice (created by setup)
-├── .local/piper/                # Piper binary (created by setup)
+├── models/                      # Piper voice onnx model (created by setup)
+├── .local/piper/                # Piper binary + espeak-ng-data (created by setup)
 ├── scripts/
-│   ├── setup-local.sh           # One-time local setup
+│   ├── setup.sh                 # One-time setup (venv, deps, Piper, Ollama)
 │   ├── run-local.sh             # Start uvicorn
 │   └── download-piper-voice.sh  # Download alternative voices
-├── .env.example
-└── .agents/                     # Agent prompt files
+├── .env                         # Local config (not committed)
+└── .env.example
 ```
 
 ## Troubleshooting
 
 - **`.env` still points at Docker** (`ollama`, `postgres` hostnames): copy values from `.env.example` (`localhost`).
-- **Piper not found**: ensure `setup-local.sh` completed; `run-local.sh` adds `.local/piper` to `PATH`.
+- **Piper not found**: ensure `setup.sh` completed; `run-local.sh` adds `.local/piper` to `PATH`.
 - **Ollama connection refused**: run `ollama serve` and check `OLLAMA_BASE_URL=http://localhost:11434`.
-- **Postgres connection failed**: create the `ava` user/database (see above) or update `DATABASE_URL`.
+- **Uvicorn fails with "No module named 'app'"**: start with `PYTHONPATH=backend` set, or use `./scripts/run-local.sh`.
+- **Call ends before bot responds**: the 8B LLM takes 2–3s per inference on CPU. If the call timeout is too short, the transcription arrives after the stream closes. Ensure `CLASSIFY_TIMEOUT` (5s default) is less than the call's silence timeout.
+- **Transcription confidence < 0.9**: transcriptions below 0.9 are filtered out. Adjust `_CONFIDENCE_THRESHOLD` in `transcription.py` if needed.

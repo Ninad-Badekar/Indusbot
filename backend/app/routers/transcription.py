@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 
@@ -8,6 +9,27 @@ from app.services.voice_pipeline import try_process_utterance
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_CONFIDENCE_THRESHOLD = 0.9
+
+
+def _extract_transcript(raw: str) -> str | None:
+    """Parse Twilio TranscriptionData JSON and return transcript text if confidence is high enough."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw.strip() or None
+
+    transcript = (data.get("transcript") or "").strip()
+    if not transcript:
+        return None
+
+    confidence = data.get("confidence")
+    if confidence is not None and confidence < _CONFIDENCE_THRESHOLD:
+        logger.info("Low confidence transcription (%.2f): %s", confidence, transcript[:60])
+        return None
+
+    return transcript
 
 
 @router.post("/transcription-callback")
@@ -47,7 +69,11 @@ async def transcription_callback(request: Request):
     if not final:
         return Response(status_code=200)
 
-    user_text = (form.get("TranscriptionData") or "").strip()
+    raw = (form.get("TranscriptionData") or "").strip()
+    if not raw:
+        return Response(status_code=200)
+
+    user_text = _extract_transcript(raw)
     if not user_text:
         return Response(status_code=200)
 

@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     twilio_transcription_engine: str = "deepgram"
     twilio_transcription_speech_model: str = "nova-2"
     twilio_transcription_hints: str = (
-        "Done, okay, yes, IndusDirect, customer ID, user ID, password, OTP, login"
+        "Done, done, okay, yes, IndusDirect, customer ID, user ID, password, OTP, login, proceed"
     )
     twilio_transcription_language: str = "en-US"
     voice_max_history_turns: int = 2

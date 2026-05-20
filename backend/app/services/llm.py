@@ -120,10 +120,198 @@ async def _warm_model(client: httpx.AsyncClient, model: str) -> None:
         pass
 
 
+_INTENT_CACHE: dict[str, str] = {}
+
+# Fast-path sets: zero-latency keyword matching before any LLM call
+_CONFIRM_WORDS = frozenset({
+    "done", "yes", "i did", "i did it", "i'm done", "im done",
+    "completed", "finished", "good to go", "proceed", "i am done",
+    "yup", "yep", "sure", "all done", "all set",
+})
+
+_REPEAT_WORDS = frozenset({
+    "can you repeat", "repeat", "say again", "what",
+    "i don't understand", "i don't get it", "help", "confused",
+    "what do i do", "what should i do", "how do i do this",
+    "not yet", "still working", "wait", "hold on",
+})
+
+
+def _classify_fallback(user_text: str) -> str:
+    """Regex-based fallback when LLM output is unusable."""
+    from app.services.memory import _CONFIRMATION, _NEGATED_CONFIRMATION
+
+    text_lower = user_text.lower().strip().rstrip(".!? ")
+
+    # Check negation first — if stripped text has no confirmation, skip
+    stripped = _NEGATED_CONFIRMATION.sub("", text_lower).strip()
+    if _CONFIRMATION.search(stripped):
+        return "confirm"
+
+    # Implicit confirmation: user is moving on without saying "Done"
+    implicit_confirm = r"\b(?:moving on|next step|next one|let'?s go|go ahead|onward|c ontinue)\b"
+    if re.search(implicit_confirm, text_lower):
+        return "confirm"
+
+    # Repeat indicators (user wants instruction again)
+    repeat_pats = (
+        r"\b(?:"
+        r"repeat|say again|again please|can you (?:repeat|say that again)|"
+        r"i (?:do not|don't|didn't) (?:get|understand|hear)|"
+        r"what was that|what did you say|come again|one more time|"
+        r"not yet|not done|haven'?t done|still working|"
+        r"not finished|need more time|"
+        r"wait|hold on|hang on|give me a moment|"
+        r"i am (?:still|not done)|i'm still)\b"
+    )
+    if re.search(repeat_pats, text_lower):
+        return "repeat"
+
+    # Off-topic indicators (check BEFORE confused to avoid false matches)
+    off_topic_pats = (
+        r"\b(?:weather|joke|story|news|sports|politics|movie|song|"
+        r"recipe|cook|game|play|music|what'?s up|how'?re? you|"
+        r"who are you|what can you do|tell me about|"
+        r"where are you from|do you like)\b"
+    )
+    if re.search(off_topic_pats, text_lower):
+        return "off_topic"
+
+    # Confused indicators
+    confused_pats = (
+        r"\b(?:confus|help|how do i|what do i|i don'?t know|"
+        r"i am (?:lost|stuck|unsure)|i'm (?:lost|stuck|confused)|"
+        r"can you (?:help|explain)|show me|guide me|"
+        r"(?:where|what|how) (?:is|are|do|can) (?:this|that|it|now|the|i))\b"
+    )
+    if re.search(confused_pats, text_lower):
+        return "confused"
+
+    return "other"
+
+
+async def classify_intent(
+    user_text: str,
+    step: int,
+    step_content: str,
+) -> str:
+    """Classify user intent using short-prompt LLM + robust post-processing.
+
+    Returns one of: confirm, repeat, confused, off_topic, other
+
+    Pipeline:
+      1. Fast-path sets (instant, zero LLM latency for obvious cases)
+      2. Cache check (instant for repeated utterances)
+      3. Short-prompt 8B LLM (2-3s on CPU for ambiguous cases)
+      4. Post-process output via keyword matching
+      5. Regex fallback if LLM output is unrecognisable
+    """
+    text_lower = user_text.lower().strip().rstrip(".!? ")
+
+    # ---- Step 1: Fast-path sets (instant) ----
+    if text_lower in _CONFIRM_WORDS:
+        return "confirm"
+    if text_lower in _REPEAT_WORDS:
+        return "repeat"
+
+    # ---- Step 2: Cache check ----
+    cache_key = f"{step}||{user_text[:100]}"
+    cached = _INTENT_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    # ---- Step 3: Short-prompt 8B LLM ----
+    instruction = extract_step_instruction(step_content)
+    prompt = (
+        f"Step {step}: {instruction[:80]}\n"
+        f"User: {user_text}\n"
+        f"Intent (confirm/repeat/confused/other):"
+    )
+
+    raw = ""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                f"{settings.ollama_base_url}/api/generate",
+                json={
+                    "model": settings.ollama_voice_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.1, "num_predict": 5, "stop": ["\n"]},
+                },
+            )
+            raw = resp.json().get("response", "").strip().lower().rstrip(".:! ")
+    except Exception:
+        pass  # Timeout or network error — fall through to regex fallback
+
+    # ---- Step 4: Post-process LLM output ----
+    if raw:
+        # Check for exact match
+        if raw in ("confirm", "repeat", "confused", "off_topic", "other"):
+            _INTENT_CACHE[cache_key] = raw
+            return raw
+
+        # Keyword match in messy output
+        if "confirm" in raw:
+            result = "confirm"
+        elif "repeat" in raw:
+            result = "repeat"
+        elif "confus" in raw:
+            result = "confused"
+        elif "off_topic" in raw or "off topic" in raw:
+            result = "off_topic"
+        elif "other" in raw:
+            result = "other"
+        else:
+            result = _classify_fallback(user_text)
+    else:
+        # ---- Step 5: Regex fallback (LLM unavailable / timed out) ----
+        result = _classify_fallback(user_text)
+
+    _INTENT_CACHE[cache_key] = result
+    return result
+
+
+def extract_step_instruction(step_content: str) -> str:
+    """Extract just the step instruction text from a KB chunk."""
+    from app.services.retrieval import extract_step_responses
+    responses = extract_step_responses(step_content)
+    if responses:
+        return " ".join(responses)
+    # Fallback: first non-empty, non-heading line
+    for line in step_content.split("\n"):
+        s = line.strip()
+        if s and not s.startswith("#") and not s.startswith("---"):
+            return s[:120]
+    return step_content[:120]
+
+
 async def warmup() -> None:
     async with httpx.AsyncClient(timeout=300.0) as client:
         await _warm_model(client, settings.ollama_model)
         await _warm_model(client, settings.ollama_voice_model)
+
+    # Pre-cache all KB step responses and goodbye sentences for instant TTS
+    from app.services.tts import synthesize_speech
+    from app.services.retrieval import get_step_content_sync, extract_step_responses
+
+    # Collect all unique texts to cache
+    texts_to_cache = []
+
+    for step_num in range(1, 9):
+        chunk = get_step_content_sync(step_num)
+        if chunk:
+            texts_to_cache.extend(extract_step_responses(chunk))
+
+    texts_to_cache.extend([
+        "You're welcome.",
+        "Your IndusDirect setup is complete.",
+        "Goodbye.",
+    ])
+
+    import asyncio
+    for text in texts_to_cache:
+        await asyncio.to_thread(synthesize_speech, text)
 
 
 async def generate_response(
